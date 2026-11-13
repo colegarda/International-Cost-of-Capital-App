@@ -244,23 +244,37 @@ def fetch_tax_rates():
                          if c in df.columns), "REF_AREA")
         df["OBS_VALUE"] = pd.to_numeric(df["OBS_VALUE"], errors="coerce")
         df["TIME_PERIOD"] = pd.to_numeric(df["TIME_PERIOD"], errors="coerce")
+        # Skip SDMX metadata columns (STRUCTURE_NAME contains "targeted small business" on every row)
+        meta_cols = {"STRUCTURE", "STRUCTURE_ID", "STRUCTURE_NAME", "ACTION", "FREQ",
+                     "Frequency of observation", "REF_AREA", "Reference area", area_col,
+                     "TIME_PERIOD", "Time period", "OBS_VALUE", "Observation value"}
         label_cols = [c for c in df.columns
-                      if not pd.api.types.is_numeric_dtype(df[c])
-                      and c not in (area_col, "TIME_PERIOD", "OBS_VALUE")]
+                      if not pd.api.types.is_numeric_dtype(df[c]) and c not in meta_cols
+                      and not c.upper().startswith(("OBS_STATUS", "UNIT_MULT", "DECIMALS"))]
         txt = df[label_cols].astype(str).agg(" | ".join, axis=1).str.lower()
+        # Remove negative phrases first so "Not targeted" does not count as targeted
+        txt = txt.str.replace(r"non[- ]?targeted|not targeted|not applicable|_z\b", " ", regex=True)
         excl = txt.str.contains(r"target|small|threshold|reduced|preferential")
         is_rate = df["OBS_VALUE"].between(0, 100)
-        # Preferred: rows explicitly labelled as the combined (central + sub-central) rate
+        unit_cols = [c for c in label_cols if "unit" in c.lower()]
+        if unit_cols:
+            utxt = df[unit_cols].astype(str).agg(" ".join, axis=1).str.lower()
+            is_rate &= utxt.str.contains(r"percent|\bpt\b") | ~utxt.str.contains(r"[a-z]")
+        meta["debug"] = {c: [str(v) for v in df[c].dropna().unique()[:8]] for c in label_cols}
+        meta["debug"]["_rows"] = [str(len(df))]
+        # 1) rows explicitly labelled as the combined (central + sub-central) rate
         sel = df[txt.str.contains("combined") & ~excl & is_rate]
         how = "combined label"
         if sel.empty:
-            # Fallback: combined statutory rate is the highest standard rate per country-year
-            pct_unit = txt.str.contains(r"percent|\bpt\b|rate")
-            sel = df[~excl & is_rate & pct_unit]
+            # 2) combined statutory rate = highest standard (non-targeted) rate per country-year
+            sel = df[~excl & is_rate]
             how = "max standard rate"
         if sel.empty:
-            raise ValueError("no usable CIT rows; label columns: " +
-                             "; ".join(f"{c}={list(df[c].dropna().unique())[:6]}" for c in label_cols)[:400])
+            # 3) last resort: highest percentage rate per country-year (targeted rates are lower)
+            sel = df[is_rate]
+            how = "max rate"
+        if sel.empty:
+            raise ValueError("no usable CIT rows – see 'OECD fetch details'")
         sub = (sel.dropna(subset=["OBS_VALUE", "TIME_PERIOD"])
                   .groupby([area_col, "TIME_PERIOD"], as_index=False)["OBS_VALUE"].max()
                   .sort_values("TIME_PERIOD").groupby(area_col).tail(1))
@@ -272,8 +286,8 @@ def fetch_tax_rates():
         }).drop_duplicates("Country")
         us = out.loc[out["Country"] == "United States", "Tax rate"]
         if us.empty or not 0.15 <= float(us.iloc[0]) <= 0.35:
-            raise ValueError(f"sanity check failed (U.S. rate={us.tolist()}, method={how}); labels: " +
-                             "; ".join(f"{c}={list(df[c].dropna().unique())[:5]}" for c in label_cols)[:300])
+            raise ValueError(f"sanity check failed (U.S. rate={us.tolist()}, method={how}) "
+                             "– see 'OECD fetch details'")
         meta["as_of"] = f"tax year {int(out['Year'].max())} (OECD SDMX API, {how})"
         return out.reset_index(drop=True), meta
     except Exception as e:  # noqa: BLE001
@@ -634,6 +648,10 @@ def show_sources(m_beta, m_spread, m_tax, m_yld, extra=None):
                  column_config={"Link": st.column_config.LinkColumn("Link")})
     if extra:
         st.caption(" · ".join(f"{k}: {v}" for k, v in extra.items()))
+    if m_tax["status"] != "ok":
+        with st.expander("OECD fetch details (for troubleshooting)"):
+            st.write("**Status:**", m_tax["status"])
+            st.json(m_tax.get("debug", {}))
     st.caption("Use **🔄 Refresh data** in the sidebar to re-fetch. Any value can be overridden manually.")
 
 
