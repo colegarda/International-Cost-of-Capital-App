@@ -242,21 +242,39 @@ def fetch_tax_rates():
             raise ValueError(" | ".join(errors))
         area_col = next((c for c in ("Reference area", "REF_AREA: Reference area", "REF_AREA")
                          if c in df.columns), "REF_AREA")
-        label_cols = [c for c in df.columns if df[c].dtype == object and c not in (area_col,)]
+        df["OBS_VALUE"] = pd.to_numeric(df["OBS_VALUE"], errors="coerce")
+        df["TIME_PERIOD"] = pd.to_numeric(df["TIME_PERIOD"], errors="coerce")
+        label_cols = [c for c in df.columns
+                      if not pd.api.types.is_numeric_dtype(df[c])
+                      and c not in (area_col, "TIME_PERIOD", "OBS_VALUE")]
         txt = df[label_cols].astype(str).agg(" | ".join, axis=1).str.lower()
-        mask = txt.str.contains("combined|comb") & ~txt.str.contains("target|small|sub-central|subcentral")
-        sub = df.loc[mask, [area_col, "TIME_PERIOD", "OBS_VALUE"]].dropna()
-        if sub.empty:
-            raise ValueError("no 'combined' CIT rows in OECD response")
-        sub["TIME_PERIOD"] = pd.to_numeric(sub["TIME_PERIOD"], errors="coerce")
-        sub = sub.sort_values("TIME_PERIOD").groupby(area_col).tail(1)
+        excl = txt.str.contains(r"target|small|threshold|reduced|preferential")
+        is_rate = df["OBS_VALUE"].between(0, 100)
+        # Preferred: rows explicitly labelled as the combined (central + sub-central) rate
+        sel = df[txt.str.contains("combined") & ~excl & is_rate]
+        how = "combined label"
+        if sel.empty:
+            # Fallback: combined statutory rate is the highest standard rate per country-year
+            pct_unit = txt.str.contains(r"percent|\bpt\b|rate")
+            sel = df[~excl & is_rate & pct_unit]
+            how = "max standard rate"
+        if sel.empty:
+            raise ValueError("no usable CIT rows; label columns: " +
+                             "; ".join(f"{c}={list(df[c].dropna().unique())[:6]}" for c in label_cols)[:400])
+        sub = (sel.dropna(subset=["OBS_VALUE", "TIME_PERIOD"])
+                  .groupby([area_col, "TIME_PERIOD"], as_index=False)["OBS_VALUE"].max()
+                  .sort_values("TIME_PERIOD").groupby(area_col).tail(1))
         area_vals = sub[area_col].astype(str).str.split(":").str[-1].str.strip()
         out = pd.DataFrame({
             "Country": area_vals.map(canon),
             "Tax rate": sub["OBS_VALUE"].astype(float) / 100,
             "Year": sub["TIME_PERIOD"].astype(int),
         }).drop_duplicates("Country")
-        meta["as_of"] = f"tax year {int(out['Year'].max())} (OECD SDMX API)"
+        us = out.loc[out["Country"] == "United States", "Tax rate"]
+        if us.empty or not 0.15 <= float(us.iloc[0]) <= 0.35:
+            raise ValueError(f"sanity check failed (U.S. rate={us.tolist()}, method={how}); labels: " +
+                             "; ".join(f"{c}={list(df[c].dropna().unique())[:5]}" for c in label_cols)[:300])
+        meta["as_of"] = f"tax year {int(out['Year'].max())} (OECD SDMX API, {how})"
         return out.reset_index(drop=True), meta
     except Exception as e:  # noqa: BLE001
         meta["status"] = f"OECD API failed ({str(e)[:300]}); using embedded OECD 2024 snapshot"
