@@ -17,7 +17,9 @@ from __future__ import annotations
 import html as htmllib
 import io
 import re
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -299,52 +301,121 @@ def fetch_tax_rates():
         return out, meta
 
 
+YIELD_CACHE = Path(__file__).with_name(".last_good_yields.csv")
+UA_ALT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+          "(KHTML, like Gecko) Version/17.4 Safari/605.1.15")
+
+
+def _te_get(url):
+    """GET a Trading Economics page with retries and alternate user agents."""
+    last = None
+    for attempt, ua in enumerate([HEADERS["User-Agent"], UA_ALT, HEADERS["User-Agent"]]):
+        try:
+            r = requests.get(url, headers={**HEADERS, "User-Agent": ua,
+                                           "Accept": "text/html,application/xhtml+xml"}, timeout=30)
+            if r.status_code == 200 and len(r.text) > 5000:
+                return r.text
+            last = f"HTTP {r.status_code}, {len(r.text)} bytes"
+        except Exception as e:  # noqa: BLE001
+            last = str(e)[:120]
+        time.sleep(1.5 * (attempt + 1))
+    raise ValueError(f"Trading Economics did not return data ({last})")
+
+
+def _parse_te_tables(html):
+    """Parse the /bonds tables with pandas; returns {country: (yield, date)}."""
+    rows = {}
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except Exception:  # noqa: BLE001  (no tables / parser missing)
+        return rows
+    for t in tables:
+        t.columns = [str(c).strip() for c in t.columns]
+        ycol = next((c for c in t.columns if c.lower() == "yield"), None)
+        if ycol is None:
+            continue
+        name_col = None
+        for c in t.columns:
+            if c == ycol or c.lower() == "date":
+                continue
+            vals = t[c].dropna().astype(str)
+            if len(vals) and vals.str.contains(r"[A-Za-z]").mean() > 0.8:
+                name_col = c
+                break
+        if name_col is None:
+            continue
+        dcol = next((c for c in t.columns if c.lower() == "date"), None)
+        for _, row in t.iterrows():
+            y = pd.to_numeric(str(row[ycol]).replace("%", ""), errors="coerce")
+            if pd.isna(y):
+                continue
+            rows.setdefault(canon(row[name_col]), (y / 100, str(row[dcol]) if dcol else ""))
+    return rows
+
+
+def _parse_te_regex(html):
+    """Fallback: read country links and the first number after them straight from the HTML."""
+    rows = {}
+    pat = re.compile(r'href="/([a-z0-9-]+)/government-bond-yield"[^>]*>\s*(?:<[^>]+>\s*)*'
+                     r'([A-Za-z][^<]{1,40}?)\s*<.{0,400}?<td[^>]*>\s*(-?\d+\.\d+)\s*%?\s*</td>',
+                     re.S)
+    for m in pat.finditer(html):
+        rows.setdefault(canon(htmllib.unescape(m.group(2))), (float(m.group(3)) / 100, ""))
+    return rows
+
+
+def te_country_slug(country):
+    special = {"United States": "united-states", "United Kingdom": "united-kingdom",
+               "South Korea": "south-korea", "Euro Area": "euro-area"}
+    return special.get(country, re.sub(r"[^a-z0-9]+", "-", country.lower()).strip("-"))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_country_yield(country):
+    """Backup: one country's 10Y yield from its own Trading Economics page."""
+    url = f"https://tradingeconomics.com/{te_country_slug(country)}/government-bond-yield"
+    try:
+        html = _te_get(url)
+        text = re.sub(r"\s+", " ", htmllib.unescape(re.sub(r"<[^>]+>", " ", html)))
+        m = (re.search(r"10[- ]?(?:year|Y)[^.%]{0,120}?(?:to|at|of)\s+(-?\d+(?:\.\d+)?)\s*%", text, re.I)
+             or re.search(r"(-?\d+(?:\.\d+)?)\s*%", text))
+        if m:
+            return float(m.group(1)) / 100, url
+    except Exception:  # noqa: BLE001
+        pass
+    return np.nan, url
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_yields():
-    """Trading Economics 10-year government bond yields (all regional tables)."""
+    """Trading Economics 10-year government bond yields (all regional tables).
+    Falls back to the last successful fetch (marked stale) if the site blocks the request."""
     meta = {"source": "Trading Economics – 10Y government bond yields", "url": TE_URL,
             "fetched": now_utc(), "as_of": "n/a", "status": "ok"}
     try:
-        r = requests.get(TE_URL, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        tables = pd.read_html(io.StringIO(r.text))
-        rows = {}
-        dates = []
-        for t in tables:
-            t.columns = [str(c).strip() for c in t.columns]
-            ycol = next((c for c in t.columns if c.lower() == "yield"), None)
-            if ycol is None:
-                continue
-            # name column = first text column that is not the yield/date column
-            name_col = None
-            for c in t.columns:
-                if c == ycol or c.lower() == "date":
-                    continue
-                vals = t[c].dropna().astype(str)
-                if len(vals) and vals.str.contains(r"[A-Za-z]").mean() > 0.8:
-                    name_col = c
-                    break
-            if name_col is None:
-                continue
-            dcol = next((c for c in t.columns if c.lower() == "date"), None)
-            for _, row in t.iterrows():
-                y = pd.to_numeric(str(row[ycol]).replace("%", ""), errors="coerce")
-                if pd.isna(y):
-                    continue
-                name = canon(row[name_col])
-                d = str(row[dcol]) if dcol else ""
-                rows.setdefault(name, (y / 100, d))
-                if d:
-                    dates.append(d)
+        html = _te_get(TE_URL)
+        rows = _parse_te_tables(html) or _parse_te_regex(html)
         if not rows:
-            raise ValueError("no yield tables parsed")
+            raise ValueError("page returned but no yield tables found (likely bot check)")
         out = pd.DataFrame([(k, v[0], v[1]) for k, v in rows.items()],
                            columns=["Country", "10Y yield", "Quote date"])
+        dates = [d for d in out["Quote date"] if d]
         if dates:
             meta["as_of"] = f"latest quote {pd.Series(dates).mode().iloc[0]} (TE table date)"
-        return out.sort_values("Country").reset_index(drop=True), meta
+        out = out.sort_values("Country").reset_index(drop=True)
+        try:
+            out.assign(_fetched=meta["fetched"]).to_csv(YIELD_CACHE, index=False)
+        except Exception:  # noqa: BLE001
+            pass
+        return out, meta
     except Exception as e:  # noqa: BLE001
-        meta["status"] = f"failed: {e} – use the manual yield overrides"
+        if YIELD_CACHE.exists():
+            cached = pd.read_csv(YIELD_CACHE)
+            when = cached["_fetched"].iloc[0] if "_fetched" in cached else "earlier"
+            meta["status"] = f"stale: live fetch failed ({str(e)[:100]}); using last good fetch from {when}"
+            meta["as_of"] = f"last good fetch {when}"
+            return cached.drop(columns=["_fetched"], errors="ignore"), meta
+        meta["status"] = f"failed: {str(e)[:150]} – trying country pages; else use manual overrides"
         return pd.DataFrame(columns=["Country", "10Y yield", "Quote date"]), meta
 
 
@@ -473,6 +544,14 @@ def main():
     tax_us, ov_tus = override("U.S. tax rate", tax_map.get("United States"), "tus")
     tax_f, ov_tf = override(f"{country} tax rate", tax_map.get(country), "tf")
     s_us, ov_s = override("USD BBB spread", spread_usd, "s")
+    for _c in {"United States", country}:
+        if pd.isna(yld_map.get(_c, np.nan)):
+            _y, _u = fetch_country_yield(_c)
+            if not pd.isna(_y):
+                yld_map[_c] = _y
+                date_map[_c] = f"country page ({now_utc()})"
+                m_yld["status"] = "ok (from individual country pages)" if m_yld["status"].startswith("failed") \
+                    else m_yld["status"]
     y_us, ov_yus = override("U.S. 10Y yield", yld_map.get("United States"), "yus")
     y_f, ov_yf = override(f"{country} 10Y yield", yld_map.get(country), "yf")
     if country == "United States" and not ov_yf:
